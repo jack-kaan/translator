@@ -24,7 +24,7 @@ from core.actions import (
     set_highlight_for_sentence,
     split_selected_sentence,
 )
-from core.pipeline import API_PROVIDERS, CATEGORIES, METHOD_TEMPLATES, NODE_TEMPLATES
+from core.pipeline import API_PROVIDERS, CATEGORIES, CORE_NODE_IDS, METHOD_TEMPLATES, NODE_TEMPLATES
 from core.state import (
     apply_node_status,
     build_artifact_index,
@@ -36,8 +36,8 @@ from core.state import (
 from services.api_client import APIClient
 
 
-def notify(ok: bool, message: str):
-    st.toast(message, icon="✅" if ok else "⚠️")
+def notify(_ok: bool, message: str):
+    st.toast(message)
 
 
 def apply_and_refresh(ok: bool, message: str):
@@ -169,10 +169,7 @@ def render_normalize_workspace(state, api_client):
 
     units = state.get("sentence_units", [])
     st.caption(f"Sentence units: {len(units)}")
-    preview = [
-        {"index": row["index"] + 1, "text": row["translated_text"][:140]}
-        for row in units[:40]
-    ]
+    preview = [{"index": row["index"] + 1, "text": row["translated_text"][:140]} for row in units[:40]]
     st.dataframe(preview, use_container_width=True, height=240)
 
 
@@ -202,14 +199,11 @@ def render_extract_workspace(state, api_client):
         key="extract_category_bucket",
     )
 
-    if state["sentence_view_mode"] == "highlight":
-        visible_units = [
-            unit
-            for unit in units
-            if artifact_map.get(unit["id"], {}).get("highlight")
-        ]
-    else:
-        visible_units = units
+    visible_units = (
+        [unit for unit in units if artifact_map.get(unit["id"], {}).get("highlight")]
+        if state["sentence_view_mode"] == "highlight"
+        else units
+    )
 
     options = [row["id"] for row in visible_units]
     default_selected = [sid for sid in state.get("selected_sentence_ids", []) if sid in options]
@@ -274,23 +268,14 @@ def render_extract_workspace(state, api_client):
         ok, msg = build_theory_background(state, api_client)
         apply_and_refresh(ok, msg)
 
-    st.caption(
-        f"Sentence blocks: {len(visible_units)} | Selected: {len(selected_ids)} | Artifacts: {len(artifacts)}"
-    )
+    st.caption(f"Sentence blocks: {len(visible_units)} | Selected: {len(selected_ids)} | Artifacts: {len(artifacts)}")
     preview_rows = []
     for unit in visible_units[:80]:
         unit_artifacts = artifact_map.get(unit["id"], {})
         category = (unit_artifacts.get("category") or [{}])[-1].get("tag", "uncategorized")
         color = (unit_artifacts.get("highlight") or [{}])[-1].get("tag", "")
         text = unit["raw_text"] if state["sentence_view_mode"] == "raw" else unit["translated_text"]
-        preview_rows.append(
-            {
-                "index": unit["index"] + 1,
-                "category": category,
-                "highlight": color,
-                "text": text[:180],
-            }
-        )
+        preview_rows.append({"index": unit["index"] + 1, "category": category, "highlight": color, "text": text[:180]})
     st.dataframe(preview_rows, use_container_width=True, height=280)
 
 
@@ -305,8 +290,7 @@ def render_theory_workspace(state, api_client):
         return
 
     st.caption("Category tree + evidence snapshot output")
-    category_map = theory.get("category_map", {})
-    st.json(category_map)
+    st.json(theory.get("category_map", {}))
     theory["draft_text"] = st.text_area(
         "Theory Draft",
         value=theory.get("draft_text", ""),
@@ -359,15 +343,12 @@ def render_question_workspace(state, api_client):
     if st.button("Approve Selected", use_container_width=True, key="approve_questions"):
         ok, msg = approve_selected_questions(state, selected)
         apply_and_refresh(ok, msg)
-
     st.caption(f"Candidates: {len(questions)}")
 
 
 def render_methodology_workspace(state, api_client, lock_info):
     method = state["methodology_context"]
-    st.warning(
-        "Lock condition: approved question + category artifacts + evidence links >= 3"
-    )
+    st.warning("Lock condition: approved question + category artifacts + evidence links >= 3")
     if lock_info["locked"]:
         for reason in lock_info["reasons"]:
             st.caption(f"- {reason}")
@@ -405,12 +386,7 @@ def render_methodology_workspace(state, api_client, lock_info):
         key="method_validity_checks",
     )
 
-    if st.button(
-        "Run Methodology Node",
-        use_container_width=True,
-        key="run_method_node",
-        disabled=lock_info["locked"],
-    ):
+    if st.button("Run Methodology Node", use_container_width=True, key="run_method_node", disabled=lock_info["locked"]):
         ok, msg = build_methodology(state, api_client)
         apply_and_refresh(ok, msg)
 
@@ -436,86 +412,241 @@ def _format_question_label(question_id, questions):
     return row["text"][:110]
 
 
+def _inject_shell_css():
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] { min-width: 72px !important; max-width: 72px !important; }
+        [data-testid="stSidebar"] .block-container { padding-top: 0.8rem; padding-left: 0.35rem; padding-right: 0.35rem; }
+        [data-testid="stSidebar"] button { font-size: 0.85rem !important; padding: 0.40rem 0 !important; line-height: 1 !important; }
+        [data-testid="stAppViewContainer"] > .main .block-container {
+            max-width: 100% !important;
+            padding-top: 0.7rem;
+            padding-left: 1rem;
+            padding-right: 1rem;
+            padding-bottom: 0.8rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _sync_query_params(state):
+    st.query_params["selected_node_id"] = state.get("selected_node_id", "")
+    st.query_params["view_mode"] = state.get("view_mode", "canvas")
+    st.query_params["menu_banner_open"] = "1" if state.get("menu_banner_open", False) else "0"
+
+
+def _hydrate_state_from_query(state):
+    query = st.query_params
+    selected_from_query = query.get("selected_node_id")
+    view_mode_from_query = query.get("view_mode")
+    menu_banner_from_query = query.get("menu_banner_open")
+    if isinstance(selected_from_query, list):
+        selected_from_query = selected_from_query[-1] if selected_from_query else None
+    if isinstance(view_mode_from_query, list):
+        view_mode_from_query = view_mode_from_query[-1] if view_mode_from_query else None
+    if isinstance(menu_banner_from_query, list):
+        menu_banner_from_query = menu_banner_from_query[-1] if menu_banner_from_query else None
+
+    node_ids = [row["id"] for row in state.get("nodes", [])]
+    if selected_from_query and selected_from_query in node_ids:
+        state["selected_node_id"] = selected_from_query
+    if view_mode_from_query in {"canvas", "tool-focus"}:
+        state["view_mode"] = view_mode_from_query
+    if menu_banner_from_query in {"0", "1"}:
+        state["menu_banner_open"] = menu_banner_from_query == "1"
+
+
+def _render_node_workspace(state, api_client, lock_info):
+    node = selected_node(state)
+    if not node:
+        st.info("Select a node from canvas.")
+        return
+    st.subheader("Node Workspace")
+    st.write(f"**{node['label']}**")
+    st.caption(f"{node['desc']} | id: {node['id']} | status: {node.get('status', 'ready')}")
+
+    if node["type"] == "reference":
+        render_reference_workspace(state, api_client)
+    elif node["type"] == "translate":
+        render_translate_workspace(state, api_client)
+    elif node["type"] == "normalize":
+        render_normalize_workspace(state, api_client)
+    elif node["type"] == "extract":
+        render_extract_workspace(state, api_client)
+    elif node["type"] == "theory":
+        render_theory_workspace(state, api_client)
+    elif node["type"] == "question":
+        render_question_workspace(state, api_client)
+    elif node["type"] == "methodology":
+        render_methodology_workspace(state, api_client, lock_info)
+
+
+def _render_left_menu(state):
+    with st.sidebar:
+        if st.button("H", use_container_width=True, help="Canvas View", key="left_menu_canvas"):
+            state["view_mode"] = "canvas"
+            _sync_query_params(state)
+            st.rerun()
+        if st.button("B", use_container_width=True, help="Work Banner", key="left_menu_banner"):
+            state["menu_banner_open"] = not state.get("menu_banner_open", False)
+            _sync_query_params(state)
+            st.rerun()
+        if st.button("W", use_container_width=True, help="Workspace", key="left_menu_workspace"):
+            state["view_mode"] = "tool-focus" if state.get("view_mode") == "canvas" else "canvas"
+            _sync_query_params(state)
+            st.rerun()
+        if st.button("R", use_container_width=True, help="Run Node", key="left_menu_run"):
+            return {"run_selected": True, "load_sample": False}
+        if st.button("S", use_container_width=True, help="Sample Workflow", key="left_menu_sample"):
+            return {"run_selected": False, "load_sample": True}
+
+        ordered_core = [
+            CORE_NODE_IDS["REF"],
+            CORE_NODE_IDS["RAW"],
+            CORE_NODE_IDS["NORM"],
+            CORE_NODE_IDS["EXTRACT"],
+            CORE_NODE_IDS["THEORY"],
+            CORE_NODE_IDS["QUESTION"],
+            CORE_NODE_IDS["METHOD"],
+        ]
+        nodes = state.get("nodes", [])
+        node_map = {row["id"]: row for row in nodes}
+        ordered_nodes = [node_map[nid] for nid in ordered_core if nid in node_map]
+        ordered_nodes.extend([row for row in nodes if row["id"] not in ordered_core])
+
+        icon_by_type = {
+            "reference": "RF",
+            "translate": "TR",
+            "normalize": "NM",
+            "extract": "EX",
+            "theory": "TH",
+            "question": "RQ",
+            "methodology": "MT",
+        }
+        for row in ordered_nodes:
+            icon = icon_by_type.get(row.get("type"), "ND")
+            if st.button(icon, use_container_width=True, help=f"{row['label']} ({row.get('status', 'ready')})", key=f"left_node_{row['id']}"):
+                if state.get("selected_node_id") == row["id"] and state.get("view_mode") == "tool-focus":
+                    state["view_mode"] = "canvas"
+                else:
+                    state["selected_node_id"] = row["id"]
+                    state["view_mode"] = "tool-focus"
+                _sync_query_params(state)
+                st.rerun()
+    return {"run_selected": False, "load_sample": False}
+
+
+def _render_command_banner(state, api_client):
+    st.info("Work Banner")
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        if st.button("Run Selected Node", use_container_width=True, key="banner_run_selected"):
+            ok, msg = run_selected_node(state, api_client)
+            apply_and_refresh(ok, msg)
+    with c2:
+        if st.button("Load Sample Workflow", use_container_width=True, key="banner_load_sample"):
+            ok, msg = load_sample_workflow_action(state)
+            apply_and_refresh(ok, msg)
+    with c3:
+        if st.button("Close Banner", use_container_width=True, key="banner_close"):
+            state["menu_banner_open"] = False
+            _sync_query_params(state)
+            st.rerun()
+
+    left, right = st.columns([1.2, 1.1], gap="medium")
+    with left:
+        events = render_builder_panel(state, NODE_TEMPLATES)
+        if events["load_sample"]:
+            ok, msg = load_sample_workflow_action(state)
+            apply_and_refresh(ok, msg)
+        if events["create_node"]:
+            ok, msg = create_node_from_builder(state)
+            apply_and_refresh(ok, msg)
+        if events["connect_nodes"]:
+            ok, msg = connect_nodes_from_builder(state)
+            apply_and_refresh(ok, msg)
+    with right:
+        status = compute_pipeline_status(state)
+        apply_node_status(state, status)
+        render_pipeline_status(state, status)
+        render_api_log(state)
+
+
 def main():
     st.set_page_config(page_title="Paper Assistant Streamlit Branch", layout="wide")
     init_session_state(st.session_state)
+    _hydrate_state_from_query(st.session_state)
+    _inject_shell_css()
 
     st.title("Paper Assistant - Streamlit Branch")
-    st.caption("Original React project is preserved. This app runs in apps/streamlit only.")
+    st.caption("Canvas uses full width. Click node on canvas to switch to node workspace.")
 
     api_client = APIClient(st.session_state)
 
-    top_col1, top_col2, top_col3 = st.columns([5, 2, 2])
-    with top_col2:
-        if st.button("Run Selected Node", use_container_width=True, key="run_selected_top"):
-            ok, msg = run_selected_node(st.session_state, api_client)
-            apply_and_refresh(ok, msg)
-    with top_col3:
-        if st.button("Load Sample Workflow", use_container_width=True, key="load_sample_top"):
-            ok, msg = load_sample_workflow_action(st.session_state)
-            apply_and_refresh(ok, msg)
+    menu_events = _render_left_menu(st.session_state)
+    if menu_events["run_selected"]:
+        ok, msg = run_selected_node(st.session_state, api_client)
+        apply_and_refresh(ok, msg)
+    if menu_events["load_sample"]:
+        ok, msg = load_sample_workflow_action(st.session_state)
+        apply_and_refresh(ok, msg)
 
-    left, center, right = st.columns([1.35, 2.6, 2.05], gap="medium")
+    status = compute_pipeline_status(st.session_state)
+    apply_node_status(st.session_state, status)
+    lock_info = methodology_lock(st.session_state, status)
 
-    with left:
-        events = render_builder_panel(st.session_state, NODE_TEMPLATES)
-        if events["load_sample"]:
-            ok, msg = load_sample_workflow_action(st.session_state)
-            apply_and_refresh(ok, msg)
-        if events["create_node"]:
-            ok, msg = create_node_from_builder(st.session_state)
-            apply_and_refresh(ok, msg)
-        if events["connect_nodes"]:
-            ok, msg = connect_nodes_from_builder(st.session_state)
-            apply_and_refresh(ok, msg)
+    if st.session_state.get("view_mode", "canvas") == "tool-focus":
+        c1, c2, c3 = st.columns([1, 1, 1])
+        with c1:
+            if st.button("Back To Canvas", use_container_width=True, key="focus_back_canvas"):
+                st.session_state["view_mode"] = "canvas"
+                _sync_query_params(st.session_state)
+                st.rerun()
+        with c2:
+            if st.button("Run Selected Node", use_container_width=True, key="focus_run_selected"):
+                ok, msg = run_selected_node(st.session_state, api_client)
+                apply_and_refresh(ok, msg)
+        with c3:
+            if st.button("Work Banner", use_container_width=True, key="focus_toggle_banner"):
+                st.session_state["menu_banner_open"] = not st.session_state.get("menu_banner_open", False)
+                _sync_query_params(st.session_state)
+                st.rerun()
 
-        status = compute_pipeline_status(st.session_state)
-        apply_node_status(st.session_state, status)
-        lock_info = methodology_lock(st.session_state, status)
+        if st.session_state.get("menu_banner_open", False):
+            _render_command_banner(st.session_state, api_client)
+        _render_node_workspace(st.session_state, api_client, lock_info)
+        _sync_query_params(st.session_state)
+        return
 
-        render_pipeline_status(st.session_state, status)
-        render_api_log(st.session_state)
-
-    with center:
-        status = compute_pipeline_status(st.session_state)
-        apply_node_status(st.session_state, status)
-        selected_id = render_canvas(
-            st.session_state["nodes"],
-            st.session_state["edges"],
-            st.session_state.get("selected_node_id"),
-        )
-        if selected_id != st.session_state.get("selected_node_id"):
-            st.session_state["selected_node_id"] = selected_id
+    top1, top2 = st.columns([1, 5])
+    with top1:
+        if st.button("Work Banner", use_container_width=True, key="canvas_toggle_banner"):
+            st.session_state["menu_banner_open"] = not st.session_state.get("menu_banner_open", False)
+            _sync_query_params(st.session_state)
             st.rerun()
+    with top2:
+        st.caption("Banner is not fixed. It appears only after pressing Work Banner.")
 
-    with right:
-        status = compute_pipeline_status(st.session_state)
-        apply_node_status(st.session_state, status)
-        lock_info = methodology_lock(st.session_state, status)
+    if st.session_state.get("menu_banner_open", False):
+        _render_command_banner(st.session_state, api_client)
 
-        node = selected_node(st.session_state)
-        if not node:
-            st.info("Select a node from canvas.")
-            return
+    status = compute_pipeline_status(st.session_state)
+    apply_node_status(st.session_state, status)
+    selected_id = render_canvas(
+        st.session_state["nodes"],
+        st.session_state["edges"],
+        st.session_state.get("selected_node_id"),
+    )
+    if selected_id and selected_id != st.session_state.get("selected_node_id"):
+        st.session_state["selected_node_id"] = selected_id
+        st.session_state["view_mode"] = "tool-focus"
+        _sync_query_params(st.session_state)
+        st.rerun()
 
-        st.subheader("Node Workspace")
-        st.write(f"**{node['label']}**")
-        st.caption(f"{node['desc']} | id: {node['id']} | status: {node.get('status', 'ready')}")
-
-        if node["type"] == "reference":
-            render_reference_workspace(st.session_state, api_client)
-        elif node["type"] == "translate":
-            render_translate_workspace(st.session_state, api_client)
-        elif node["type"] == "normalize":
-            render_normalize_workspace(st.session_state, api_client)
-        elif node["type"] == "extract":
-            render_extract_workspace(st.session_state, api_client)
-        elif node["type"] == "theory":
-            render_theory_workspace(st.session_state, api_client)
-        elif node["type"] == "question":
-            render_question_workspace(st.session_state, api_client)
-        elif node["type"] == "methodology":
-            render_methodology_workspace(st.session_state, api_client, lock_info)
+    _sync_query_params(st.session_state)
 
 
 if __name__ == "__main__":

@@ -1,130 +1,251 @@
-import html
+from collections import defaultdict
 
 import streamlit as st
-import streamlit.components.v1 as components
+
+try:
+    from streamlit_flow import streamlit_flow
+    from streamlit_flow.elements import StreamlitFlowEdge, StreamlitFlowNode
+    from streamlit_flow.state import StreamlitFlowState
+
+    FLOW_AVAILABLE = True
+except Exception:
+    FLOW_AVAILABLE = False
 
 
-NODE_WIDTH = 250
-NODE_HEIGHT = 110
-
-
-def _status_colors(status):
-    if status == "completed":
-        return "#10b981", "#ecfdf5", "#065f46"
-    if status == "ready":
-        return "#3b82f6", "#eff6ff", "#1e3a8a"
-    if status == "blocked":
-        return "#94a3b8", "#f8fafc", "#475569"
-    return "#94a3b8", "#f8fafc", "#475569"
-
-
-def _truncate(value, length=40):
-    if len(value) <= length:
-        return value
-    return f"{value[: length - 3]}..."
-
-
-def _escape(value):
-    return html.escape(str(value))
-
-
-def _edge_path(from_node, to_node, mode, sibling_offset):
-    if mode == "vertical":
-        x1 = from_node["x"] + NODE_WIDTH / 2 + sibling_offset
-        y1 = from_node["y"] + NODE_HEIGHT
-        x2 = to_node["x"] + NODE_WIDTH / 2 + sibling_offset
-        y2 = to_node["y"]
-        dy = y2 - y1
-        c1y = y1 + dy / 2
-        c2y = y2 - dy / 2
-        path = f"M {x1} {y1} C {x1} {c1y}, {x2} {c2y}, {x2} {y2}"
-        lx = (x1 + x2) / 2
-        ly = (y1 + y2) / 2 - 10
-        return path, lx, ly
-
-    x1 = from_node["x"] + NODE_WIDTH
-    y1 = from_node["y"] + NODE_HEIGHT / 2 + sibling_offset
-    x2 = to_node["x"]
-    y2 = to_node["y"] + NODE_HEIGHT / 2 + sibling_offset
-    dx = x2 - x1
-    c1 = x1 + dx / 2
-    c2 = x2 - dx / 2
-    path = f"M {x1} {y1} C {c1} {y1}, {c2} {y2}, {x2} {y2}"
-    lx = (x1 + x2) / 2
-    ly = y1 - 8
-    return path, lx, ly
+STATUS_COLORS = {
+    "completed": "#22c55e",
+    "ready": "#3b82f6",
+    "blocked": "#ef4444",
+    "idle": "#64748b",
+}
 
 
 def render_canvas(nodes, edges, selected_node_id):
-    if not nodes:
-        st.info("No nodes available.")
-        return None
+    _inject_canvas_css()
+    if not FLOW_AVAILABLE:
+        return _render_fallback(nodes, selected_node_id)
 
-    max_x = max(node["x"] for node in nodes) + NODE_WIDTH + 140
-    max_y = max(node["y"] for node in nodes) + NODE_HEIGHT + 140
-    width = max(1600, int(max_x))
-    height = max(520, int(max_y))
+    flow_nodes = [_to_flow_node(node, selected_node_id) for node in nodes]
+    flow_edges = _to_flow_edges(edges, selected_node_id)
+    flow_state = StreamlitFlowState(
+        nodes=flow_nodes,
+        edges=flow_edges,
+        selected_id=selected_node_id,
+    )
 
-    node_map = {node["id"]: node for node in nodes}
-    svg_parts = [
-        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">',
-        '<rect x="0" y="0" width="100%" height="100%" fill="#f8fafc"/>',
+    next_state = _run_flow(flow_state)
+    _sync_positions(nodes, next_state)
+    selected = _extract_selected(next_state)
+    if selected:
+        return selected
+    return selected_node_id
+
+
+def _run_flow(flow_state):
+    base = {
+        "fit_view": True,
+        "show_minimap": False,
+        "show_controls": True,
+        "allow_new_edges": False,
+        "animate_new_edges": False,
+        "height": 780,
+    }
+    candidates = [
+        base,
+        {k: v for k, v in base.items() if k not in {"allow_new_edges", "animate_new_edges"}},
+        {"fit_view": True, "height": 780},
+        {},
     ]
 
-    for edge in edges:
-        from_node = node_map.get(edge["from_id"])
-        to_node = node_map.get(edge["to_id"])
-        if not from_node or not to_node:
+    last_error = None
+    for options in candidates:
+        try:
+            return streamlit_flow("paper-assistant-canvas", flow_state, **options)
+        except TypeError as exc:
+            last_error = exc
             continue
-        siblings = [e for e in edges if e["from_id"] == edge["from_id"] and e["to_id"] == edge["to_id"]]
-        sibling_idx = next((idx for idx, row in enumerate(siblings) if row["id"] == edge["id"]), 0)
-        sibling_offset = (sibling_idx - (len(siblings) - 1) / 2) * (26 if edge.get("mode") == "parallel" else 18)
-        active = selected_node_id in {edge["from_id"], edge["to_id"]}
+    if last_error:
+        st.warning(f"streamlit_flow signature mismatch: {last_error}")
+    return flow_state
 
-        path, lx, ly = _edge_path(from_node, to_node, edge.get("mode", "horizontal"), sibling_offset)
-        stroke = "#3b82f6" if active else "#cbd5e1"
-        text_fill = "#1d4ed8" if active else "#64748b"
-        svg_parts.append(
-            f'<path d="{path}" fill="none" stroke="{stroke}" stroke-width="2.6" />'
-        )
-        svg_parts.append(
-            f'<text x="{lx}" y="{ly}" fill="{text_fill}" font-size="11" text-anchor="middle" font-weight="600">{_escape(edge.get("label", ""))}</text>'
+
+def _to_flow_node(node, selected_node_id):
+    status = node.get("status", "idle")
+    selected = node["id"] == selected_node_id
+    color = STATUS_COLORS.get(status, STATUS_COLORS["idle"])
+    style = {
+        "background": "#0f172a",
+        "color": "#e2e8f0",
+        "borderRadius": "12px",
+        "border": f"2px solid {'#60a5fa' if selected else color}",
+        "boxShadow": "0 8px 20px rgba(2, 6, 23, 0.45)",
+        "fontSize": "12px",
+        "padding": "8px",
+    }
+    content = f"{node.get('label', node['id'])}\n{status.upper()}"
+
+    kwargs = {
+        "id": node["id"],
+        "pos": (int(node.get("x", 0)), int(node.get("y", 0))),
+        "data": {"content": content},
+        "node_type": "default",
+        "draggable": True,
+        "selectable": True,
+        "connectable": False,
+        "deletable": False,
+        "width": 260,
+        "height": 92,
+        "style": style,
+    }
+    try:
+        return StreamlitFlowNode(**kwargs)
+    except TypeError:
+        return StreamlitFlowNode(
+            id=node["id"],
+            pos=(int(node.get("x", 0)), int(node.get("y", 0))),
+            data={"content": content},
         )
 
+
+def _to_flow_edges(edges, selected_node_id):
+    rendered = []
+    sibling_index = defaultdict(int)
+    for edge in edges:
+        key = (edge.get("from_id"), edge.get("to_id"))
+        sibling_index[key] += 1
+        index = sibling_index[key] - 1
+        rendered.append(_to_flow_edge(edge, index, selected_node_id))
+    return rendered
+
+
+def _to_flow_edge(edge, index, selected_node_id):
+    mode = edge.get("mode", "horizontal")
+    edge_type = "default"
+    animated = False
+    style = {
+        "stroke": "#64748b",
+        "strokeWidth": 2,
+    }
+
+    if mode == "vertical":
+        edge_type = "step"
+        style["stroke"] = "#14b8a6"
+    elif mode == "parallel":
+        edge_type = "straight"
+        animated = True
+        style["stroke"] = "#f59e0b"
+        style["strokeDasharray"] = "4 4"
+
+    if index > 0:
+        style["strokeWidth"] = 1.5
+        style["strokeOpacity"] = 0.85
+        animated = True
+
+    if edge.get("from_id") == selected_node_id or edge.get("to_id") == selected_node_id:
+        style["strokeWidth"] = max(style["strokeWidth"], 3)
+
+    label = edge.get("label", "")
+    kwargs = {
+        "id": edge["id"],
+        "source": edge["from_id"],
+        "target": edge["to_id"],
+        "label": label,
+        "edge_type": edge_type,
+        "animated": animated,
+        "marker_end": {"type": "arrow"},
+        "style": style,
+    }
+    try:
+        return StreamlitFlowEdge(**kwargs)
+    except TypeError:
+        return StreamlitFlowEdge(
+            id=edge["id"],
+            source=edge["from_id"],
+            target=edge["to_id"],
+            label=label,
+            edge_type=edge_type,
+            animated=animated,
+        )
+
+
+def _sync_positions(nodes, next_state):
+    flow_nodes = _extract_nodes(next_state)
+    if not flow_nodes:
+        return
+    pos_map = {}
+    for flow_node in flow_nodes:
+        node_id = _node_id(flow_node)
+        xy = _extract_xy(flow_node)
+        if node_id and xy:
+            pos_map[node_id] = xy
     for node in nodes:
-        selected = node["id"] == selected_node_id
-        border, bg, text_color = _status_colors(node.get("status", "ready"))
-        stroke = "#4f46e5" if selected else border
-        stroke_width = 3 if selected else 2
-        x = node["x"]
-        y = node["y"]
-        svg_parts.append(
-            f'<rect x="{x}" y="{y}" width="{NODE_WIDTH}" height="{NODE_HEIGHT}" rx="12" fill="{bg}" stroke="{stroke}" stroke-width="{stroke_width}" />'
-        )
-        svg_parts.append(
-            f'<text x="{x + 12}" y="{y + 28}" fill="#0f172a" font-size="13" font-weight="700">{_escape(_truncate(node.get("label", ""), 34))}</text>'
-        )
-        svg_parts.append(
-            f'<text x="{x + 12}" y="{y + 50}" fill="#475569" font-size="11">{_escape(_truncate(node.get("desc", ""), 44))}</text>'
-        )
-        svg_parts.append(
-            f'<text x="{x + 12}" y="{y + 78}" fill="{text_color}" font-size="10" font-weight="600">status: {_escape(node.get("status", "ready"))}</text>'
-        )
-        svg_parts.append(
-            f'<text x="{x + 12}" y="{y + 96}" fill="#64748b" font-size="9">{_escape(node.get("id", ""))}</text>'
-        )
+        if node["id"] in pos_map:
+            x, y = pos_map[node["id"]]
+            node["x"] = int(x)
+            node["y"] = int(y)
 
-    svg_parts.append("</svg>")
-    html_block = "".join(svg_parts)
-    components.html(html_block, height=min(max(height + 20, 380), 900), scrolling=True)
 
-    options = [node["id"] for node in nodes]
-    if selected_node_id not in options:
-        selected_node_id = options[0]
-    selected_id = st.selectbox(
-        "Selected Node",
-        options,
-        index=options.index(selected_node_id),
-        format_func=lambda nid: next((f"{row['label']} ({row['id']})" for row in nodes if row["id"] == nid), nid),
+def _extract_nodes(flow_state):
+    if flow_state is None:
+        return []
+    if isinstance(flow_state, dict):
+        return flow_state.get("nodes", [])
+    return getattr(flow_state, "nodes", [])
+
+
+def _extract_selected(flow_state):
+    if flow_state is None:
+        return None
+    if isinstance(flow_state, dict):
+        return flow_state.get("selected_id")
+    return getattr(flow_state, "selected_id", None)
+
+
+def _node_id(flow_node):
+    if isinstance(flow_node, dict):
+        return flow_node.get("id")
+    return getattr(flow_node, "id", None)
+
+
+def _extract_xy(flow_node):
+    if isinstance(flow_node, dict):
+        pos = flow_node.get("pos", flow_node.get("position"))
+    else:
+        pos = getattr(flow_node, "pos", None)
+        if pos is None:
+            pos = getattr(flow_node, "position", None)
+
+    if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+        return pos[0], pos[1]
+    if isinstance(pos, dict):
+        if "x" in pos and "y" in pos:
+            return pos["x"], pos["y"]
+    if pos is not None:
+        x = getattr(pos, "x", None)
+        y = getattr(pos, "y", None)
+        if x is not None and y is not None:
+            return x, y
+    return None
+
+
+def _render_fallback(nodes, selected_node_id):
+    st.warning("Install `streamlit-flow-component` to use full canvas interactions.")
+    ids = [node["id"] for node in nodes]
+    if not ids:
+        return None
+    if selected_node_id not in ids:
+        selected_node_id = ids[0]
+    return st.selectbox("Node", ids, index=ids.index(selected_node_id), key="fallback_canvas_select")
+
+
+def _inject_canvas_css():
+    st.markdown(
+        """
+        <style>
+        .st-key-fallback_canvas_select {
+            margin-bottom: 0.75rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
-    return selected_id
